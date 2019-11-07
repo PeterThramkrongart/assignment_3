@@ -1,0 +1,349 @@
+                                                                                                 ---
+title: "Assignment 3 - Part 2 - Diagnosing Schizophrenia from Voice"
+author: "Riccardo Fusaroli"
+date: "October 17, 2017"
+output:
+  github_document
+
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+############################################ SET UP LIBRARIES AND FILES ############################################
+
+# load libraries and packages
+
+pacman::p_load(tidyverse, tidymodels, groupdata2, kernlab, cvms,caret,lme4, Matrix, Metrics,knitr)
+
+# set working directory to source code folder
+localPath <- getwd()
+setwd(localPath)
+
+# load the data from part 1 into a dataframe
+goodData <- read.csv("cleanData.csv")
+
+```
+
+## Assignment 3 - Part 2 - Diagnosing schizophrenia from voice
+
+In the previous part of the assignment you generated a bunch of "features", that is, of quantitative descriptors of voice in schizophrenia. We then looked at whether we could replicate results from the previous literature.
+We now want to know whether we can automatically diagnose schizophrenia from voice only, that is, relying on the set of features you produced last time, we will try to produce an automated classifier.
+Again, remember that the dataset containst 7 studies and 3 languages. Feel free to only include Danish (Study 1-4) if you feel that adds too much complexity.
+
+Issues to be discussed your report:
+- Should you run the analysis on all languages/studies at the same time? 
+- Choose your best acoustic feature from part 1. How well can you diagnose schizophrenia just using it?
+- Identify the best combination of acoustic features to diagnose schizophrenia using logistic regression.
+- Discuss the "classification" process: which methods are you using? Which confounds should you be aware of? What are the strength and limitation of the analysis?
+- Bonus question: Logistic regression is only one of many classification algorithms. Try using others and compare performance. Some examples: Discriminant Function, Random Forest, Support Vector Machine, etc. The package caret provides them. 
+- Bonus Bonus question: It is possible combine the output of multiple  classification models to improve classification accuracy. For inspiration see,
+https://machinelearningmastery.com/machine-learning-ensembles-with-r/
+ The interested reader might also want to look up 'The BigChaos Solution to the Netflix Grand Prize'
+
+## Learning objectives
+- Learn the basics of classification in a machine learning framework
+- Design, fit and report logistic regressions
+- Apply feature selection techniques
+
+### Let's start
+
+We first want to build a logistic regression to see whether you can diagnose schizophrenia from your best acoustic feature. Let's use the full dataset and calculate the different performance measures (accuracy, sensitivity, specificity, PPV, NPV, ROC curve). You need to think carefully as to how we should (or not) use study and subject ID.
+
+Then cross-validate the logistic regression and re-calculate performance on the testing folds. N.B. The cross-validation functions you already have should be tweaked: you need to calculate these new performance measures. Alternatively, the groupdata2 and cvms package created by Ludvig are an easy solution. 
+
+N.B. the predict() function generates log odds (the full scale between minus and plus infinity). Log odds > 0 indicates a choice of 1, below a choice of 0.
+N.N.B. you need to decide whether calculate performance on each single test fold or save all the prediction for test folds in one datase, so to calculate overall performance.
+N.N.N.B. Now you have two levels of structure: subject and study. Should this impact your cross-validation?
+N.N.N.N.B. A more advanced solution could rely on the tidymodels set of packages (warning: Time-consuming to learn as the documentation is sparse, but totally worth it)
+
+
+
+```{r}
+###################################################### CLEANING DATA ##########################################################
+
+# select only the Danish studies in the data frame
+goodDanishData <- filter(goodData, Study < 5)
+
+# omit NA's from data set
+goodDanishData<- na.omit(goodDanishData)
+# omit other types of NA's i.e. "--undefined--" entry from data set
+goodDanishData <- filter(goodDanishData,ASD..speakingtime.nsyll. != " --undefined--")
+
+# remove factor levels by making average syllable duration values numeric
+goodDanishData$ASD..speakingtime.nsyll. <- as.numeric(as.character(goodDanishData$ASD..speakingtime.nsyll.))
+# factorize selected study and participant features
+goodDanishData <- goodDanishData %>% 
+  mutate_at(c("uID", "Language","Diagnosis","Gender","Subject","uPairID"), as.factor)
+# characterize soundnames and trials
+goodDanishData <- goodDanishData %>% 
+  mutate_at(c("soundname", "Trial"), as.character)
+
+# scale multiple prosodic and linguistic features for later comparison
+#scale number of pauses
+goodDanishData$scaledNPauses <- scale(goodDanishData$npause)
+# scale statistical features
+goodDanishData <- goodDanishData %>% mutate_at(c("mean", "sd", "min", "max","IQR"), scale)
+# scale number of syllables
+goodDanishData <- goodDanishData %>% mutate_at(c("articulation.rate..nsyll...phonationtime.", "ASD..speakingtime.nsyll.", "dur..s.", "nsyll","speechrate..nsyll.dur.","phonationtime..s."), scale)
+# scale pitch range which is calculated from the minimum and maximum pitch frequency
+goodDanishData$range <- scale(goodDanishData$max-goodDanishData$min)
+
+# create a separate dataframe, deselecting features which are deemed unnecessary or too closely correlated with either the diagnosis schizophrenia or pitch
+tidyData <- goodDanishData %>%
+  select(-Language,-X,-npause,-soundname,-Trial,-SANS,-SAPS,-uPairID,-Study,-Education,-VerbalIQ,-NonVerbalIQ,-TotalIQ,-Subject,-uID) #since it is highly correlated with Age and Gender = Female
+
+
+
+```
+
+
+```{r,analysis simple glm}
+#making a models with range, IQR and articulation rate
+sdModelGLM <- glm(Diagnosis~sd,goodDanishData, family = "binomial")
+
+
+
+
+
+# creating folds column
+cleanDataFold<- fold(goodDanishData, k = 10,
+             cat_col = 'Diagnosis',
+             id_col = 'uID') %>% 
+  arrange(.folds)
+
+#defining some simple models
+models <- c("Diagnosis~sd","Diagnosis~IQR","Diagnosis~range","Diagnosis~articulation.rate..nsyll...phonationtime.","Diagnosis~speechrate..nsyll.dur.","Diagnosis~ASD..speakingtime.nsyll.")
+
+# cross-validating some different simple models
+simpleCV <- cross_validate(cleanDataFold,models ,
+                      fold_cols = ".folds",
+                      family = "binomial",
+                        rm_nc = F,
+                        REML = FALSE)
+
+#displaying the results of the cross-validtion
+simpleCV %>% select_metrics() %>% kable()
+
+#predicting data
+goodDanishData$PredictionsPerc=predict(sdModelGLM , type ="response")
+
+#assigning classes to prediction percentages
+goodDanishData$Predictions[goodDanishData$PredictionsPerc>0.5]="Schizophrenia"
+goodDanishData$Predictions[goodDanishData$PredictionsPerc<=0.5]="Control"
+goodDanishData$Predictions <- as.factor(goodDanishData$Predictions)
+
+#printing confusion matrix
+caret::confusionMatrix(data = goodDanishData$Predictions, reference = goodDanishData$Diagnosis, positive = "Control")
+
+
+#rock the curve!
+goodDanishData %>%
+  roc_curve(truth = Diagnosis, PredictionsPerc) %>% 
+  autoplot()
+
+#making scatterplot
+ggplot(goodDanishData,aes(x=sd,y=Diagnosis,color=Diagnosis))+geom_point()+geom_jitter()
+```
+
+```{r, Tidymodels}
+# set seed used in partitioning
+set.seed(5)
+# partition the data so that diagnosis is equally balanced between folds
+tidyDataList <- partition(tidyData, p = 0.2, cat_col = c("Diagnosis"), id_col = NULL, list_out = T)
+
+# create partitioned test and train dataframes from the list of dataframes
+tidyDataTest <- tidyDataList[[1]]
+tidyDataTrain <- tidyDataList[[2]]
+
+#tidyDataTest$uID <- as.factor(paste(as.character(tidyDataTest$uID),"_test"))
+
+# create a recipe that trains the data to a model created from all variable predictors in the tidyDataTrain data frame
+rec <- tidyDataTrain %>% recipe(Diagnosis ~ .) %>% # define the outcome
+  step_center(all_numeric()) %>% # center numeric predictors
+  step_scale(all_numeric()) %>% # scale numeric predictors
+  step_corr(all_numeric()) %>% 
+  prep(training = tidyDataTrain)
+
+# extract finalized training set from recipe
+trainBaked <- juice(rec)
+
+# inspect recipe
+rec
+
+# apply the trained data recipe to test dataframe
+testBaked <- rec %>% bake(tidyDataTest)
+
+# fit logistic regression model with all predictors included to the training data set
+logFit <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") %>%
+  fit(Diagnosis ~ . , data = trainBaked)
+
+# fit support vector machine model with all predictors included to the training data set
+svmFit <-
+  svm_rbf() %>%
+  set_mode("classification") %>% 
+  set_engine("kernlab") %>%
+  fit(Diagnosis ~ . , data = trainBaked)
+
+# predict class (Diagnosis/Control) using the fitted logistic model
+logClass <- logFit %>%
+  predict(new_data = testBaked)
+
+# predict probabilities of classes (Diagnosis/Control)
+logProb <- logFit %>%
+  predict(new_data = testBaked, type = "prob") %>%
+  pull(.pred_Schizophrenia)
+
+# get multiple predictions at once, creating a dataframe with assigned probabilities and classes for the two types of model types (logistic and svm)
+testResults <- 
+  testBaked %>% 
+  select(Diagnosis) %>% 
+  mutate(
+    logClass = predict(logFit, new_data = testBaked) %>% 
+      pull(.pred_class),
+    logProb  = predict(logFit, new_data = testBaked, type = "prob") %>% 
+      pull(.pred_Schizophrenia),
+    svmClass = predict(svmFit, new_data = testBaked) %>% 
+      pull(.pred_class),
+    svmProb  = predict(svmFit, new_data = testBaked, type = "prob") %>% 
+      pull(.pred_Schizophrenia)
+  )
+
+# examine the first 5 elements in the dataframe
+testResults %>% 
+  head(5) %>% 
+  knitr::kable()
+
+# calculate performance metrics from the logistic regression predictions
+metrics(testResults, truth = Diagnosis, estimate = logClass) %>% 
+  knitr::kable()
+
+# calculate performance metrics from the support vector machine predictions
+metrics(testResults, truth = Diagnosis, estimate = svmClass) %>% 
+  knitr::kable()
+
+# plot the ROC (receiver operating characteristic) curve
+testResults %>%
+  roc_curve(truth = Diagnosis, logProb) %>% 
+  autoplot()
+
+# plot the ROC (receiver operating characteristic) curve
+testResults %>%
+  roc_curve(truth = Diagnosis, svmProb) %>% 
+  autoplot()
+
+# plot the gain curve
+testResults %>% 
+  mutate(logProb = 1 - logProb) %>% # for the plot to show correctly (otherwise the line would be flipped)
+  gain_curve(truth = Diagnosis, logProb) %>% 
+  autoplot()
+
+
+# plot the gain curve
+testResults %>% 
+  mutate(svmProb = 1 - svmProb) %>% # for the plot to show correctly (otherwise the line would be flipped)
+  gain_curve(truth = Diagnosis, svmProb) %>% 
+  autoplot()
+
+
+# create 10 folds over 10 iterations, diagnosis is balanced across folds
+cvFolds <- vfold_cv(tidyDataTrain, v = 10, repeats = 10, strata = Diagnosis)
+
+# prepare data set and fetch training data
+cvFolds <- cvFolds %>% 
+  mutate(recipes = splits %>%
+           map(prepper, recipe = rec),
+         train_data = splits %>% map(training))
+
+
+# create a model, which is not fitted to our training data
+logFit <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") 
+
+svmFit <-
+  svm_rbf() %>%
+  set_mode("classification") %>% 
+  set_engine("kernlab")
+
+# train the model on each fold
+cvFoldsLog <- cvFolds %>%  mutate(
+  logFits = pmap(list(recipes, train_data), #input 
+                            ~ fit(logFit, formula(.x), data = bake(object = .x, new_data = .y)) # function to apply
+                 ))
+
+# train the model on each fold
+cvFoldsSVM <- cvFolds %>%  mutate(
+  svmFits = pmap(list(recipes, train_data), #input 
+                            ~ fit(svmFit, formula(.x), data = bake(object = .x, new_data = .y)) # function to apply
+                 ))
+
+
+
+# create a function that takes split data, recipe and model and returns a tibble of the actual and predicted data
+predictLog <- function(split, rec, model) {
+  bakedTestLog <- bake(rec, testing(split))
+  tibble(
+    actual = bakedTestLog$Diagnosis,
+    predicted = predict(model, new_data = bakedTestLog) %>% pull(.pred_class),
+    prop_Schizophrenia =  predict(model, new_data = bakedTestLog, type = "prob") %>% pull(.pred_Schizophrenia),
+    prop_Control =  predict(model, new_data = bakedTestLog, type = "prob") %>% pull(`.pred_Control`)
+  ) 
+}
+
+predictSVM <- function(split, rec, model) {
+  bakedTestSVM <- bake(rec, testing(split))
+  tibble(
+    actual = bakedTestSVM$Diagnosis,
+    predicted = predict(model, new_data = bakedTestSVM) %>% pull(.pred_class),
+    prop_Schizophrenia =  predict(model, new_data = bakedTestSVM, type = "prob") %>% pull(.pred_Schizophrenia),
+    prop_Control =  predict(model, new_data = bakedTestSVM, type = "prob") %>% pull(`.pred_Control`)
+  ) 
+}
+
+
+# apply our function predictLog to each split, with their respective recipes and models and save the actual and predicted data to a new column
+cvFoldsLog <- cvFoldsLog %>% 
+  mutate(pred = pmap(list(splits, recipes, logFits) , predictLog))
+
+
+cvFoldsSVM <- cvFoldsSVM %>% 
+  mutate(pred = pmap(list(splits, recipes, svmFits) , predictSVM))
+
+##################################### EVALUATING MODELS ############################################
+
+# create a dataframe containing the information about folds and iterations as well as metrics on accuracy, kappa value, roc area under curve, and mean logarithmic loss
+evalLog <- 
+  cvFoldsLog %>% 
+  mutate(
+    metrics = pmap(list(pred), ~ metrics(., truth = actual, estimate = predicted, prop_Schizophrenia))) %>% 
+  select(id, id2, metrics) %>% 
+  unnest(metrics)
+
+evalSVM <- 
+  cvFoldsSVM %>% 
+  mutate(
+    metrics = pmap(list(pred), ~ metrics(., truth = actual, estimate = predicted, prop_Schizophrenia))) %>% 
+  select(id, id2, metrics) %>% 
+  unnest(metrics)
+
+# create dataframe with performance metrics and inspect the first 15 rows in the dataframe
+evalLog %>% 
+  select(repeat_n = id, fold_n = id2, metric = .metric, estimate = .estimate) %>% 
+  spread(metric, estimate) %>% 
+  head(15) %>% 
+  knitr::kable()
+
+
+# create dataframe with performance metrics and inspect the first 15 rows in the dataframe
+evalSVM %>% 
+  select(repeat_n = id, fold_n = id2, metric = .metric, estimate = .estimate) %>% 
+  spread(metric, estimate) %>% 
+  head(15) %>% 
+  knitr::kable()
+
+```
+
